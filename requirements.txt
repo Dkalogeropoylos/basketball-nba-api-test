@@ -1,3 +1,4 @@
 streamlit
 pandas
-nba_api
+requests
+pyarrow
