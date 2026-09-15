@@ -16,12 +16,15 @@ class BacktestResult:
     most_rows: pd.DataFrame
     failures: pd.DataFrame
     runtime_seconds: float
+    start_index: int = 0
+    end_index: int = 0
+    eligible_games: int = 0
 
 
 def _game_pairs(team_db: pd.DataFrame, min_prior_games: int = 15, start_date=None, end_date=None):
     x = team_db.copy()
     x["GAME_DATE"] = pd.to_datetime(x["GAME_DATE"], errors="coerce")
-    x = x.dropna(subset=["GAME_DATE"]).sort_values(["GAME_DATE","GAME_ID","TEAM_ABBR"])
+    x = x.dropna(subset=["GAME_DATE"]).sort_values(["GAME_DATE", "GAME_ID", "TEAM_ABBR"])
     if start_date is not None:
         x = x[x["GAME_DATE"] >= pd.Timestamp(start_date)]
     if end_date is not None:
@@ -29,6 +32,13 @@ def _game_pairs(team_db: pd.DataFrame, min_prior_games: int = 15, start_date=Non
 
     full = team_db.copy()
     full["GAME_DATE"] = pd.to_datetime(full["GAME_DATE"], errors="coerce")
+    # Pre-compute each team's completed-game dates once. This does not change the
+    # model; it only avoids scanning the full table twice for every historical game.
+    team_dates = {
+        str(team).upper(): np.sort(g["GAME_DATE"].dropna().to_numpy(dtype="datetime64[ns]"))
+        for team, g in full.groupby(full["TEAM_ABBR"].astype(str).str.upper(), sort=False)
+    }
+
     out = []
     for gid, g in x.groupby("GAME_ID", sort=False):
         if len(g) != 2:
@@ -39,12 +49,18 @@ def _game_pairs(team_db: pd.DataFrame, min_prior_games: int = 15, start_date=Non
             continue
         hr, ar = homes.iloc[0], aways.iloc[0]
         date = pd.Timestamp(hr["GAME_DATE"])
-        hp = full[(full["TEAM_ABBR"].astype(str).str.upper() == str(hr["TEAM_ABBR"]).upper()) & (full["GAME_DATE"] < date)]["GAME_ID"].nunique()
-        ap = full[(full["TEAM_ABBR"].astype(str).str.upper() == str(ar["TEAM_ABBR"]).upper()) & (full["GAME_DATE"] < date)]["GAME_ID"].nunique()
+        hkey = str(hr["TEAM_ABBR"]).upper()
+        akey = str(ar["TEAM_ABBR"]).upper()
+        hp = int(np.searchsorted(team_dates.get(hkey, np.array([], dtype="datetime64[ns]")), np.datetime64(date), side="left"))
+        ap = int(np.searchsorted(team_dates.get(akey, np.array([], dtype="datetime64[ns]")), np.datetime64(date), side="left"))
         if hp < min_prior_games or ap < min_prior_games:
             continue
-        out.append((str(gid), date, hr, ar, int(hp), int(ap)))
+        out.append((str(gid), date, hr, ar, hp, ap))
     return out
+
+
+def eligible_game_count(team_db: pd.DataFrame, min_prior_games: int = 15, start_date=None, end_date=None) -> int:
+    return len(_game_pairs(team_db, min_prior_games=min_prior_games, start_date=start_date, end_date=end_date))
 
 
 def _actual_stat(row, market: str) -> float:
@@ -64,29 +80,53 @@ def run_walk_forward(
     min_prior_games: int = 15,
     n_sims: int = 2500,
     max_games: int | None = None,
+    start_index: int = 0,
     start_date=None,
     end_date=None,
     use_rotation_similarity: bool = True,
     progress_callback=None,
 ) -> BacktestResult:
+    """Run a leakage-safe slice of the eligible chronological game list.
+
+    start_index/max_games make the backtest batchable without changing any
+    pregame information or model coefficient. Seeds use the absolute game index,
+    so splitting a season into batches reproduces the same simulation draws that
+    a one-shot run would have used.
+    """
     t0 = time.time()
-    games = _game_pairs(team_db, min_prior_games=min_prior_games, start_date=start_date, end_date=end_date)
-    if max_games is not None and max_games > 0:
-        games = games[: int(max_games)]
+    all_games = _game_pairs(team_db, min_prior_games=min_prior_games, start_date=start_date, end_date=end_date)
+    eligible = len(all_games)
+    start_index = int(max(start_index, 0))
+    if start_index >= eligible:
+        return BacktestResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), 0.0,
+                              start_index=start_index, end_index=start_index, eligible_games=eligible)
+
+    if max_games is None or int(max_games) <= 0:
+        end_index = eligible
+    else:
+        end_index = min(eligible, start_index + int(max_games))
+    games = all_games[start_index:end_index]
 
     detail_rows = []
     prob_rows = []
     most_rows = []
     failures = []
 
-    for i, (gid, date, hr, ar, hp, ap) in enumerate(games):
+    team_dates = pd.to_datetime(team_db["GAME_DATE"], errors="coerce")
+    player_dates = pd.to_datetime(player_db["GAME_DATE"], errors="coerce") if player_db is not None and not player_db.empty else None
+
+    for local_i, (gid, date, hr, ar, hp, ap) in enumerate(games):
+        global_i = start_index + local_i
         try:
-            team_hist = team_db[pd.to_datetime(team_db["GAME_DATE"], errors="coerce") < date].copy()
-            player_hist = player_db[pd.to_datetime(player_db["GAME_DATE"], errors="coerce") < date].copy()
+            team_hist = team_db.loc[team_dates < date].copy()
+            if player_dates is not None:
+                player_hist = player_db.loc[player_dates < date].copy()
+            else:
+                player_hist = pd.DataFrame()
             home = str(hr["TEAM_ABBR"]).upper(); away = str(ar["TEAM_ABBR"]).upper()
             pack = project_game_pregame(
                 team_hist, player_hist, home, away, calibration,
-                n_sims=n_sims, seed=10000 + i, use_rotation_similarity=use_rotation_similarity,
+                n_sims=n_sims, seed=10000 + global_i, use_rotation_similarity=use_rotation_similarity,
             )
             hs, as_ = pack["home"], pack["away"]
             for scope, team, sim, actual_row in [
@@ -131,7 +171,7 @@ def run_walk_forward(
             failures.append({"GAME_ID": gid, "GAME_DATE": date, "Error": repr(exc)})
 
         if progress_callback is not None:
-            progress_callback(i + 1, len(games))
+            progress_callback(local_i + 1, len(games))
 
     return BacktestResult(
         detail=pd.DataFrame(detail_rows),
@@ -139,4 +179,7 @@ def run_walk_forward(
         most_rows=pd.DataFrame(most_rows),
         failures=pd.DataFrame(failures),
         runtime_seconds=float(time.time() - t0),
+        start_index=start_index,
+        end_index=end_index,
+        eligible_games=eligible,
     )
