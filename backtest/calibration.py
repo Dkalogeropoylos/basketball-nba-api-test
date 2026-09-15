@@ -79,10 +79,17 @@ def _pair_residuals_frozen(
         return []
 
     residuals: list[float] = []
-    for r in h.itertuples(index=False):
+    # Do not use namedtuple attribute access here. Structural feature names such
+    # as ``3P_SHARE`` are valid DataFrame column labels but are NOT valid Python
+    # identifiers, so pandas.itertuples() silently renames them (e.g. to _N).
+    # Label-based Series access keeps the frozen H2H residual path valid for all
+    # FEATURES and avoids selectively dropping rematches from walk-forward tests.
+    for _, r in h.iterrows():
+        row_date = r["GAME_DATE"]
+        row_game_id = r["GAME_ID"]
         prior = g[
-            (g["GAME_DATE"] < r.GAME_DATE)
-            | ((g["GAME_DATE"] == r.GAME_DATE) & (g["GAME_ID"].astype(str) < str(r.GAME_ID)))
+            (g["GAME_DATE"] < row_date)
+            | ((g["GAME_DATE"] == row_date) & (g["GAME_ID"].astype(str) < str(row_game_id)))
         ].copy()
         if len(prior) < 80:
             continue
@@ -95,7 +102,7 @@ def _pair_residuals_frozen(
             continue
         own = _cfg_baseline(own_hist, feature, league, cfg)
         opp_allowed = _cfg_baseline(opp_hist, feature, league, WeightConfig.stable())
-        actual = float(getattr(r, feature))
+        actual = float(r[feature])
         if not all(np.isfinite(v) for v in (own, opp_allowed, actual)):
             continue
         lg_t = float(_transform(feature, [league])[0])
