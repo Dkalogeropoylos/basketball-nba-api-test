@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -13,6 +14,17 @@ from backtest.engine import run_walk_forward, eligible_game_count
 from backtest.evaluation import metric_table, calibration_bins, most_summary
 from backtest.data_loader import season_label
 from backtest.variance_experiment import VARIANTS, late_half_start_index
+from backtest.shared_line_eval import (
+    B3_FGA_PROCESS,
+    B3_FTA_LOG_SIGMA,
+    checkpoint_bytes as shared_checkpoint_bytes,
+    load_fixed_a_lines,
+    reference_audit,
+    restore_checkpoint as restore_shared_checkpoint,
+    run_shared_line_batch,
+    shared_line_calibration_bins,
+    shared_line_summary,
+)
 
 
 st.set_page_config(page_title="NBA V2 C4 Variance A/B", layout="wide")
@@ -264,3 +276,194 @@ if cal is not None and val_pack is not None:
         if isinstance(fail, pd.DataFrame) and not fail.empty:
             st.error("Failures detected — do not interpret A/B metrics until failures are resolved.")
             st.dataframe(fail, use_container_width=True, hide_index=True)
+
+    # ---------------------------------------------------------------------
+    # D. FINAL 2024-25 SHARED-LINE PROBABILITY TEST
+    # ---------------------------------------------------------------------
+    st.divider()
+    st.subheader("D. Shared-line probability A/B — SAME exact lines")
+    st.caption(
+        "This is the final 2024-25 probability test before the untouched 2025-26 exam. "
+        "Frozen baseline A is NOT rerun. B3 is rerun only to evaluate P(Over/Under) at the exact same A half-point lines. "
+        "Because several lines come from one game, uncertainty is clustered by GAME_ID."
+    )
+
+    fixed_path = Path(__file__).resolve().parent / "nba_c5_A_fixed_lines_late498.csv.gz"
+    if not fixed_path.exists():
+        st.error(
+            "Missing nba_c5_A_fixed_lines_late498.csv.gz in the repo root. "
+            "Upload the bundled frozen-A reference file before running section D."
+        )
+    else:
+        a_lines = load_fixed_a_lines(fixed_path)
+        audit = reference_audit(a_lines)
+        st.info(
+            f"Frozen A reference: {audit['games']} late-half games, {audit['rows']:,} exact lines; "
+            f"non-half lines={audit['non_half_lines']}, rows with push probability>0={audit['push_rows']}. "
+            "Expected: 498 games, only half-point lines, zero pushes."
+        )
+
+        shared_sig = {
+            "train": int(train_season),
+            "validation": int(validation_season),
+            "min_games": 15,
+            "n_sims": 1500,
+            "rotation": True,
+            "eligible": int(eligible),
+            "split": int(split),
+            "fga_process": B3_FGA_PROCESS,
+            "fta_log_sigma": float(B3_FTA_LOG_SIGMA),
+            "a_reference_games": int(audit["games"]),
+            "a_reference_rows": int(audit["rows"]),
+        }
+
+        if "c5_next_index" not in st.session_state:
+            st.session_state["c5_rows"] = pd.DataFrame()
+            st.session_state["c5_fail"] = pd.DataFrame()
+            st.session_state["c5_next_index"] = int(split)
+            st.session_state["c5_signature"] = shared_sig
+
+        saved_shared_sig = st.session_state.get("c5_signature")
+        shared_next = int(st.session_state.get("c5_next_index", split))
+        shared_done = max(0, min(shared_next, eligible) - split)
+
+        if saved_shared_sig is not None and saved_shared_sig != shared_sig and shared_done > 0:
+            st.error("Shared-line settings/signature changed after batches were accumulated. Reset section D before continuing.")
+        else:
+            if saved_shared_sig is None:
+                st.session_state["c5_signature"] = shared_sig
+
+            c5a, c5b, c5c = st.columns([1, 1, 1])
+            c5a.metric("Shared-line completed", f"{shared_done}/{eval_games}")
+            c5b.metric("B3 sims/game", "1500")
+            shared_batch_size = c5c.number_input(
+                "Shared-line games per batch",
+                min_value=20,
+                max_value=200,
+                value=100,
+                step=20,
+                key="c5_batch_size",
+            )
+
+            left_d, right_d = st.columns([2, 1])
+            run_shared = left_d.button(
+                "3) Run NEXT B3 shared-line batch",
+                type="primary",
+                disabled=(shared_next >= eligible),
+                key="run_c5_shared",
+            )
+            reset_shared = right_d.button("Reset shared-line test", key="reset_c5_shared")
+
+            if reset_shared:
+                st.session_state["c5_rows"] = pd.DataFrame()
+                st.session_state["c5_fail"] = pd.DataFrame()
+                st.session_state["c5_next_index"] = int(split)
+                st.session_state["c5_signature"] = shared_sig
+                st.rerun()
+
+            if run_shared:
+                bar_d = st.progress(0.0, text=f"Preparing shared-line season index {shared_next}...")
+
+                def prog_shared(done, total):
+                    bar_d.progress(
+                        done / max(total, 1),
+                        text=f"Shared-line batch: {done}/{total} | absolute start index {shared_next}",
+                    )
+
+                with st.spinner("Rerunning B3 only and scoring the frozen A lines..."):
+                    rr, ff, end_idx, _ = run_shared_line_batch(
+                        val_pack["team"],
+                        val_pack["player"],
+                        cal,
+                        a_lines,
+                        start_index=int(shared_next),
+                        max_games=int(shared_batch_size),
+                        min_prior_games=15,
+                        n_sims=1500,
+                        use_rotation_similarity=True,
+                        progress_callback=prog_shared,
+                    )
+                st.session_state["c5_rows"] = _append(st.session_state.get("c5_rows"), rr)
+                st.session_state["c5_fail"] = _append(st.session_state.get("c5_fail"), ff)
+                st.session_state["c5_next_index"] = int(end_idx)
+                st.session_state["c5_signature"] = shared_sig
+                bar_d.empty()
+                st.rerun()
+
+        with st.expander("Shared-line checkpoint / restore", expanded=False):
+            up_shared = st.file_uploader(
+                "Restore shared-line checkpoint ZIP", type=["zip"], key="restore_c5_integrated"
+            )
+            if up_shared is not None and st.button("Restore shared-line checkpoint", key="restore_c5_btn"):
+                sr, sf, smeta = restore_shared_checkpoint(up_shared.getvalue())
+                if smeta.get("signature") != shared_sig:
+                    st.error("Shared-line checkpoint signature does not match the frozen settings/reference.")
+                else:
+                    st.session_state["c5_rows"] = sr
+                    st.session_state["c5_fail"] = sf
+                    st.session_state["c5_next_index"] = int(smeta.get("next_index", split))
+                    st.session_state["c5_signature"] = shared_sig
+                    st.success("Shared-line checkpoint restored.")
+                    st.rerun()
+
+        shared_rows = st.session_state.get("c5_rows", pd.DataFrame())
+        shared_fail = st.session_state.get("c5_fail", pd.DataFrame())
+        shared_next = int(st.session_state.get("c5_next_index", split))
+
+        if isinstance(shared_rows, pd.DataFrame) and not shared_rows.empty:
+            shared_games = shared_rows["GAME_ID"].astype(str).nunique()
+            st.success(
+                f"B3 scored on frozen A lines for {shared_games}/{eval_games} games; failures={len(shared_fail)}."
+            )
+
+            summary_shared = shared_line_summary(shared_rows)
+            st.markdown("**Paired scoring on identical lines**")
+            st.dataframe(summary_shared.round(5), use_container_width=True, hide_index=True)
+            st.caption(
+                "For Δ columns, negative B3-A is better for B3. The Brier 95% interval is bootstrapped after clustering rows by GAME_ID."
+            )
+
+            tab_a, tab_b = st.tabs(["Calibration — A", "Calibration — B3"])
+            with tab_a:
+                st.dataframe(
+                    shared_line_calibration_bins(shared_rows, "P_A_Over").round(4),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            with tab_b:
+                st.dataframe(
+                    shared_line_calibration_bins(shared_rows, "P_B3_Over").round(4),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            shared_meta = {
+                "signature": shared_sig,
+                "next_index": int(shared_next),
+            }
+            st.download_button(
+                "Download shared-line checkpoint ZIP",
+                shared_checkpoint_bytes(shared_rows, shared_fail, shared_meta),
+                file_name=f"nba_c5_shared_lines_{shared_games}games.zip",
+                mime="application/zip",
+                key="download_c5_checkpoint",
+            )
+            st.download_button(
+                "Download shared-line detail CSV",
+                shared_rows.to_csv(index=False),
+                file_name="nba_c5_shared_line_rows.csv",
+                mime="text/csv",
+                key="download_c5_rows",
+            )
+            st.download_button(
+                "Download shared-line summary CSV",
+                summary_shared.to_csv(index=False),
+                file_name="nba_c5_shared_line_summary.csv",
+                mime="text/csv",
+                key="download_c5_summary",
+            )
+
+            if isinstance(shared_fail, pd.DataFrame) and not shared_fail.empty:
+                st.error("Shared-line failures detected — do not interpret probability A/B until resolved.")
+                st.dataframe(shared_fail, use_container_width=True, hide_index=True)
+
