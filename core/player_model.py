@@ -147,7 +147,7 @@ def build_player_profile(
     }
 
     # Calculate only the small set of distinct inner-weight views required by
-    # this player. Minutes are intentionally left neutral because the 200-minute
+    # this player. Minutes are intentionally left neutral because the 240-minute
     # engine already models them directly.
     cache = {}
     def bucket_features(bucket_name: str, stat_key: str | None):
@@ -218,10 +218,15 @@ def simulate_player(profile: dict, ctx: PlayerContext, n=50_000, seed=1, opportu
     z_ast = rng.normal(size=n)
     z_shoot = rng.normal(size=n)
 
+    # NBA regulation exposure is physically capped at 48 minutes.
+    # Keep the historical +/-8-minute stress band, but never allow the
+    # Monte Carlo tail to create impossible >48 regulation-minute games.
+    minute_floor = max(0.0, min(48.0, max(4.0, ctx.projected_minutes - 8.0)))
+    minute_ceiling = min(48.0, max(minute_floor, ctx.projected_minutes + 8.0))
     mins = np.clip(
         ctx.projected_minutes + ctx.minutes_sd * z_min,
-        max(4.0, ctx.projected_minutes - 8.0),
-        ctx.projected_minutes + 8.0,
+        minute_floor,
+        minute_ceiling,
     )
     pace = ctx.pace_multiplier * np.exp(0.035 * z_pace - 0.5 * 0.035**2)
     role = np.exp(0.05 * z_role - 0.5 * 0.05**2)

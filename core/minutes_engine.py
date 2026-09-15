@@ -716,10 +716,10 @@ def project_team_minutes(
         ),
     )
     out["Low Min"] = np.clip(
-        out["Projected Min"] - 1.20 * out["Minutes SD"], 0, 40
+        out["Projected Min"] - 1.20 * out["Minutes SD"], 0, 48
     )
     out["High Min"] = np.clip(
-        out["Projected Min"] + 1.20 * out["Minutes SD"], 0, 40
+        out["Projected Min"] + 1.20 * out["Minutes SD"], 0, 48
     )
 
     out.attrs["redistribution_matrix"] = matrix
