@@ -84,6 +84,9 @@ def run_walk_forward(
     start_date=None,
     end_date=None,
     use_rotation_similarity: bool = True,
+    *,
+    fga_process: str = "poisson",
+    fta_log_sigma: float = 0.12,
     progress_callback=None,
 ) -> BacktestResult:
     """Run a leakage-safe slice of the eligible chronological game list.
@@ -126,7 +129,9 @@ def run_walk_forward(
             home = str(hr["TEAM_ABBR"]).upper(); away = str(ar["TEAM_ABBR"]).upper()
             pack = project_game_pregame(
                 team_hist, player_hist, home, away, calibration,
-                n_sims=n_sims, seed=10000 + global_i, use_rotation_similarity=use_rotation_similarity,
+                n_sims=n_sims, seed=10000 + global_i,
+                use_rotation_similarity=use_rotation_similarity,
+                fga_process=str(fga_process), fta_log_sigma=float(fta_log_sigma),
             )
             hs, as_ = pack["home"], pack["away"]
             for scope, team, sim, actual_row in [

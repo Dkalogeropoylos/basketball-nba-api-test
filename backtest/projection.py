@@ -79,6 +79,9 @@ def project_game_pregame(
     n_sims: int = 3000,
     seed: int = 100,
     use_rotation_similarity: bool = True,
+    *,
+    fga_process: str = "poisson",
+    fta_log_sigma: float = 0.12,
 ):
     """Leakage-safe team-market projection from history available before tip.
 
@@ -171,6 +174,7 @@ def project_game_pregame(
     home_sim, away_sim = simulate_game(
         home_profile, away_profile, ctx(home_mod, home_blk_pos), ctx(away_mod, away_blk_pos),
         n=int(n_sims), seed=int(seed),
+        fga_process=str(fga_process), fta_log_sigma=float(fta_log_sigma),
     )
     return {
         "home": home_sim,
