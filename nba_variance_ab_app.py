@@ -25,6 +25,19 @@ from backtest.shared_line_eval import (
     shared_line_calibration_bins,
     shared_line_summary,
 )
+from backtest.final_exam import (
+    FINAL_MIN_PRIOR_GAMES,
+    FINAL_N_SIMS,
+    FINAL_ROTATION,
+    center_head_to_head as final_center_head_to_head,
+    checkpoint_bytes as final_checkpoint_bytes,
+    final_most_summary,
+    final_shared_calibration,
+    final_shared_summary,
+    restore_checkpoint as restore_final_checkpoint,
+    run_final_exam_batch,
+    variant_metric_table as final_variant_metric_table,
+)
 
 
 st.set_page_config(page_title="NBA V2 C4 Variance A/B", layout="wide")
@@ -89,7 +102,7 @@ def _restore_checkpoint(raw: bytes):
         )
 
 
-st.warning("2025-26 FINAL TEST is deliberately unavailable in this app.")
+st.info("2025-26 FINAL TEST stays locked until you explicitly freeze B3 in Section E. The 2024-25 controls above remain development-only.")
 
 c1, c2, c3 = st.columns(3)
 train_season = c1.selectbox("TRAIN league parameters", [2024], format_func=lambda x: season_label(x))
@@ -467,3 +480,235 @@ if cal is not None and val_pack is not None:
                 st.error("Shared-line failures detected — do not interpret probability A/B until resolved.")
                 st.dataframe(shared_fail, use_container_width=True, hide_index=True)
 
+
+
+# -------------------------------------------------------------------------
+# E. UNTOUCHED 2025-26 FINAL EXAM — FROZEN A vs FROZEN B3
+# -------------------------------------------------------------------------
+st.divider()
+st.subheader("E. UNTOUCHED 2025-26 FINAL EXAM — frozen B3")
+st.caption(
+    "This is the one-shot generalization exam. No 2025-26 result is used to tune parameters. "
+    "The 2023-24 league calibration, B3 FGA rebound-chain, B3 FTA dispersion, 15-game minimum, "
+    "1500 simulations and rotation weighting are all frozen before the season is loaded."
+)
+st.warning(
+    "Protocol guard: once you inspect 2025-26 results, do NOT change the architecture or parameters because of them. "
+    "Any later production refit must reuse the validated methodology and be evaluated on future data."
+)
+
+confirm_final = st.checkbox(
+    "I confirm B3 is frozen from the 2024-25 development/A-B process and I will not tune it from 2025-26 results.",
+    key="c6_confirm_final",
+)
+freeze_phrase = st.text_input(
+    "Type FREEZE B3 to unlock the final exam",
+    key="c6_freeze_phrase",
+    placeholder="FREEZE B3",
+)
+final_unlocked = bool(confirm_final and freeze_phrase.strip().upper() == "FREEZE B3")
+
+if cal is None:
+    st.info("First use button 1 above to load 2023-24 and fit the frozen TRAIN calibration.")
+else:
+    load_final = st.button(
+        "4) Load untouched 2025-26 FINAL season",
+        type="primary",
+        disabled=not final_unlocked,
+        key="c6_load_final",
+    )
+    if load_final:
+        with st.spinner("Loading untouched 2025-26 regular-season data..."):
+            final_pack = load_season(2026)
+            final_eligible = eligible_game_count(
+                final_pack["team"], min_prior_games=FINAL_MIN_PRIOR_GAMES
+            )
+            st.session_state["c6_final_pack"] = final_pack
+            st.session_state["c6_detail"] = pd.DataFrame()
+            st.session_state["c6_shared"] = pd.DataFrame()
+            st.session_state["c6_most"] = pd.DataFrame()
+            st.session_state["c6_fail"] = pd.DataFrame()
+            st.session_state["c6_next_index"] = 0
+            st.session_state["c6_runtime"] = 0.0
+            st.session_state["c6_signature"] = {
+                "train_calibration": "2023-24 frozen",
+                "final_season": "2025-26",
+                "min_prior_games": FINAL_MIN_PRIOR_GAMES,
+                "n_sims": FINAL_N_SIMS,
+                "rotation_similarity": FINAL_ROTATION,
+                "A_fga_process": "poisson",
+                "A_fta_log_sigma": 0.12,
+                "B3_fga_process": B3_FGA_PROCESS,
+                "B3_fta_log_sigma": float(B3_FTA_LOG_SIGMA),
+                "eligible_games": int(final_eligible),
+            }
+        st.success(
+            f"FINAL season loaded. Eligible 2025-26 games after the fixed {FINAL_MIN_PRIOR_GAMES}-game minimum: {final_eligible}."
+        )
+        st.rerun()
+
+final_pack = st.session_state.get("c6_final_pack")
+if cal is not None and final_pack is not None:
+    final_eligible = eligible_game_count(
+        final_pack["team"], min_prior_games=FINAL_MIN_PRIOR_GAMES
+    )
+    final_sig = {
+        "train_calibration": "2023-24 frozen",
+        "final_season": "2025-26",
+        "min_prior_games": FINAL_MIN_PRIOR_GAMES,
+        "n_sims": FINAL_N_SIMS,
+        "rotation_similarity": FINAL_ROTATION,
+        "A_fga_process": "poisson",
+        "A_fta_log_sigma": 0.12,
+        "B3_fga_process": B3_FGA_PROCESS,
+        "B3_fta_log_sigma": float(B3_FTA_LOG_SIGMA),
+        "eligible_games": int(final_eligible),
+    }
+
+    if st.session_state.get("c6_signature") != final_sig:
+        st.error("FINAL-test signature mismatch. Do not continue; reload the final season with the frozen settings.")
+    else:
+        next_final = int(st.session_state.get("c6_next_index", 0))
+        done_final = min(next_final, final_eligible)
+        st.info(
+            f"FINAL 2025-26: completed {done_final}/{final_eligible}; remaining {max(final_eligible-done_final, 0)}. "
+            f"Frozen protocol: min prior={FINAL_MIN_PRIOR_GAMES}, sims/game={FINAL_N_SIMS}, rotation=ON, variants=A and B3."
+        )
+
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("Eligible final games", f"{final_eligible}")
+        cc2.metric("Completed", f"{done_final}")
+        final_batch_size = cc3.number_input(
+            "FINAL games per batch",
+            min_value=20,
+            max_value=200,
+            value=100,
+            step=20,
+            key="c6_batch_size",
+        )
+
+        run_final = st.button(
+            "5) Run NEXT untouched FINAL batch (A + B3 + same A lines)",
+            type="primary",
+            disabled=(next_final >= final_eligible),
+            key="c6_run_final",
+        )
+        if run_final:
+            bar_f = st.progress(0.0, text=f"Preparing FINAL season index {next_final}...")
+
+            def prog_final(done, total):
+                bar_f.progress(
+                    done / max(total, 1),
+                    text=f"FINAL batch: {done}/{total} | absolute start index {next_final}",
+                )
+
+            with st.spinner("Running frozen A and frozen B3 on untouched 2025-26..."):
+                fr = run_final_exam_batch(
+                    final_pack["team"],
+                    final_pack["player"],
+                    cal,
+                    start_index=int(next_final),
+                    max_games=int(final_batch_size),
+                    progress_callback=prog_final,
+                )
+            st.session_state["c6_detail"] = _append(st.session_state.get("c6_detail"), fr["detail"])
+            st.session_state["c6_shared"] = _append(st.session_state.get("c6_shared"), fr["shared"])
+            st.session_state["c6_most"] = _append(st.session_state.get("c6_most"), fr["most"])
+            st.session_state["c6_fail"] = _append(st.session_state.get("c6_fail"), fr["failures"])
+            st.session_state["c6_next_index"] = int(fr["end_index"])
+            st.session_state["c6_runtime"] = float(st.session_state.get("c6_runtime", 0.0)) + float(fr["runtime_seconds"])
+            bar_f.empty()
+            st.rerun()
+
+        with st.expander("FINAL checkpoint / restore", expanded=False):
+            up_final = st.file_uploader("Restore FINAL checkpoint ZIP", type=["zip"], key="restore_c6_final")
+            if up_final is not None and st.button("Restore FINAL checkpoint", key="restore_c6_final_btn"):
+                fd, fs, fm, ff, fmeta = restore_final_checkpoint(up_final.getvalue())
+                if fmeta.get("signature") != final_sig:
+                    st.error("FINAL checkpoint signature does not match the frozen final-test protocol.")
+                else:
+                    st.session_state["c6_detail"] = fd
+                    st.session_state["c6_shared"] = fs
+                    st.session_state["c6_most"] = fm
+                    st.session_state["c6_fail"] = ff
+                    st.session_state["c6_next_index"] = int(fmeta.get("next_index", 0))
+                    st.session_state["c6_runtime"] = float(fmeta.get("runtime_total", 0.0))
+                    st.session_state["c6_signature"] = final_sig
+                    st.success("FINAL checkpoint restored.")
+                    st.rerun()
+
+        final_detail = st.session_state.get("c6_detail", pd.DataFrame())
+        final_shared = st.session_state.get("c6_shared", pd.DataFrame())
+        final_most = st.session_state.get("c6_most", pd.DataFrame())
+        final_fail = st.session_state.get("c6_fail", pd.DataFrame())
+        next_final = int(st.session_state.get("c6_next_index", 0))
+
+        if isinstance(final_detail, pd.DataFrame) and not final_detail.empty:
+            final_games_done = final_detail["GAME_ID"].astype(str).nunique()
+            st.success(
+                f"FINAL accumulated games: {final_games_done}/{final_eligible}; failures={len(final_fail)}; "
+                f"compute time={float(st.session_state.get('c6_runtime',0.0))/60:.1f} min."
+            )
+
+            st.markdown("**E1. Center + distribution — frozen A vs frozen B3**")
+            st.dataframe(final_variant_metric_table(final_detail).round(5), use_container_width=True, hide_index=True)
+
+            st.markdown("**E2. Same-game center head-to-head**")
+            st.dataframe(final_center_head_to_head(final_detail).round(5), use_container_width=True, hide_index=True)
+
+            st.markdown("**E3. Probability A/B on the SAME A-defined half-point lines**")
+            final_prob_summary = final_shared_summary(final_shared)
+            st.dataframe(final_prob_summary.round(5), use_container_width=True, hide_index=True)
+            st.caption("Negative B3-A is better for B3. Lines are generated from A pregame simulations only; actual outcomes never define the lines.")
+
+            tab_fa, tab_fb = st.tabs(["FINAL calibration — A", "FINAL calibration — B3"])
+            with tab_fa:
+                st.dataframe(final_shared_calibration(final_shared, "A").round(4), use_container_width=True, hide_index=True)
+            with tab_fb:
+                st.dataframe(final_shared_calibration(final_shared, "B3").round(4), use_container_width=True, hide_index=True)
+
+            st.markdown("**E4. Most-market calibration — frozen A vs frozen B3**")
+            st.dataframe(final_most_summary(final_most).round(5), use_container_width=True, hide_index=True)
+
+            final_meta = {
+                "signature": final_sig,
+                "next_index": int(next_final),
+                "runtime_total": float(st.session_state.get("c6_runtime", 0.0)),
+            }
+            st.download_button(
+                "Download resumable FINAL checkpoint ZIP",
+                final_checkpoint_bytes(final_detail, final_shared, final_most, final_fail, final_meta),
+                file_name=f"nba_c6_final_2025_26_{final_games_done}games.zip",
+                mime="application/zip",
+                key="download_c6_checkpoint",
+            )
+            st.download_button(
+                "Download FINAL detail CSV",
+                final_detail.to_csv(index=False),
+                file_name="nba_c6_final_detail.csv",
+                mime="text/csv",
+                key="download_c6_detail",
+            )
+            st.download_button(
+                "Download FINAL shared-line rows CSV",
+                final_shared.to_csv(index=False),
+                file_name="nba_c6_final_shared_line_rows.csv",
+                mime="text/csv",
+                key="download_c6_shared",
+            )
+            st.download_button(
+                "Download FINAL Most rows CSV",
+                final_most.to_csv(index=False),
+                file_name="nba_c6_final_most_rows.csv",
+                mime="text/csv",
+                key="download_c6_most",
+            )
+
+            if isinstance(final_fail, pd.DataFrame) and not final_fail.empty:
+                st.error("FINAL-test failures detected. Do not interpret the exam until every failure is resolved.")
+                st.dataframe(final_fail, use_container_width=True, hide_index=True)
+
+            if next_final >= final_eligible and (final_fail is None or final_fail.empty):
+                st.success(
+                    "FINAL 2025-26 exam complete with zero failures. Export everything and evaluate once; do not tune B3 from this season."
+                )
