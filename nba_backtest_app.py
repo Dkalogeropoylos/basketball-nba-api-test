@@ -1,24 +1,73 @@
 from __future__ import annotations
 
+import io
+import json
+import zipfile
 import streamlit as st
 import pandas as pd
 
 from providers.sportsdataverse_nba import SportsDataverseNBA
 from backtest.calibration import fit_league_calibration
-from backtest.engine import run_walk_forward
+from backtest.engine import run_walk_forward, eligible_game_count
 from backtest.evaluation import metric_table, calibration_bins, most_summary
 from backtest.data_loader import season_label
 
 st.set_page_config(page_title="NBA V2 Walk-Forward Backtest", layout="wide")
 st.title("NBA V2 — Walk-Forward Validation Sandbox")
 st.caption(
-    "Train league-level parameters on 2023-24, validate on 2024-25, then keep 2025-26 untouched for the final test. "
-    "Team identity always comes from current-season games completed before tip."
+    "BATCHED C3: identical frozen model logic, but the full season is evaluated in short resumable batches so "
+    "Streamlit Cloud does not need one 20–30 minute continuous run."
 )
 
 @st.cache_data(show_spinner=False)
 def load_season(season: int):
     return SportsDataverseNBA(timeout=60).load_season(int(season))
+
+
+def _empty_state():
+    st.session_state["bt_acc_detail"] = pd.DataFrame()
+    st.session_state["bt_acc_prob"] = pd.DataFrame()
+    st.session_state["bt_acc_most"] = pd.DataFrame()
+    st.session_state["bt_acc_fail"] = pd.DataFrame()
+    st.session_state["bt_next_index"] = 0
+    st.session_state["bt_runtime_total"] = 0.0
+    st.session_state["bt_batch_signature"] = None
+
+
+def _append(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    if new is None or new.empty:
+        return old if isinstance(old, pd.DataFrame) else pd.DataFrame()
+    if old is None or old.empty:
+        return new.reset_index(drop=True)
+    return pd.concat([old, new], ignore_index=True)
+
+
+def _checkpoint_bytes(detail, prob, most, fail, meta) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("detail.csv", detail.to_csv(index=False))
+        z.writestr("probability_rows.csv", prob.to_csv(index=False))
+        z.writestr("most_rows.csv", most.to_csv(index=False))
+        z.writestr("failures.csv", fail.to_csv(index=False))
+        z.writestr("meta.json", json.dumps(meta, indent=2))
+    return buf.getvalue()
+
+
+def _restore_checkpoint(raw: bytes):
+    with zipfile.ZipFile(io.BytesIO(raw), "r") as z:
+        def read_csv(name):
+            with z.open(name) as f:
+                try:
+                    return pd.read_csv(f)
+                except pd.errors.EmptyDataError:
+                    return pd.DataFrame()
+        detail = read_csv("detail.csv")
+        prob = read_csv("probability_rows.csv")
+        most = read_csv("most_rows.csv")
+        fail = read_csv("failures.csv")
+        meta = json.loads(z.read("meta.json").decode("utf-8"))
+    return detail, prob, most, fail, meta
+
 
 unlock_final = st.checkbox(
     "Unlock FINAL TEST 2025-26 (only after 2024-25 settings are frozen)",
@@ -34,11 +83,11 @@ if validation_season == 2026:
     st.error("FINAL TEST unlocked. Do not tune any coefficient/setting after seeing these results.")
 
 with st.expander("Run settings", expanded=True):
-    a,b,c = st.columns(3)
-    n_sims = a.select_slider("Simulations per historical game", options=[1000,1500,2500,5000,10000], value=2500)
-    max_games = b.number_input("Max games (0 = all eligible)", min_value=0, max_value=1230, value=40, step=10)
+    a, b, c = st.columns(3)
+    n_sims = a.select_slider("Simulations per historical game", options=[1000,1500,2500,5000,10000], value=1500)
+    batch_size = b.number_input("Games per batch", min_value=20, max_value=300, value=100, step=20)
     rotation = c.toggle("Pregame rotation-similarity weighting", value=True)
-    st.caption("Start with 40 games as a smoke test. Once clean, set Max games = 0 for the full validation run.")
+    st.caption("Recommended: 100 games/batch. Each click is a short independent slice; accumulated results are identical in logic to a one-shot run.")
 
 if st.button("1) Load seasons + fit TRAIN calibration", type="primary"):
     with st.spinner("Loading SportsDataverse seasons and fitting frozen league-level parameters..."):
@@ -48,6 +97,7 @@ if st.button("1) Load seasons + fit TRAIN calibration", type="primary"):
         st.session_state["bt_train_pack"] = train_pack
         st.session_state["bt_val_pack"] = val_pack
         st.session_state["bt_cal"] = cal
+        _empty_state()
     st.success(
         f"Loaded TRAIN {season_label(train_season)} and VALIDATION {season_label(validation_season)}. "
         f"Frozen pace weights: fast={cal.pace['fast_weight']:.3f}, slow={cal.pace['slow_weight']:.3f}, SD={cal.pace['rmse']:.3f}."
@@ -66,52 +116,114 @@ if cal is not None:
         st.dataframe(cal.opponent_audit.round(4), use_container_width=True, hide_index=True)
 
 if cal is not None and val_pack is not None:
-    if st.button("2) Run leakage-safe walk-forward validation"):
-        bar = st.progress(0.0, text="Preparing games...")
-        def prog(done, total):
-            bar.progress(done/max(total,1), text=f"Historical games: {done}/{total}")
-        with st.spinner("Running historical pregame projections..."):
-            res = run_walk_forward(
-                val_pack["team"], val_pack["player"], cal,
-                min_prior_games=int(min_games), n_sims=int(n_sims),
-                max_games=(None if int(max_games)==0 else int(max_games)),
-                use_rotation_similarity=bool(rotation), progress_callback=prog,
-            )
-        st.session_state["bt_result"] = res
-        bar.empty()
+    eligible = eligible_game_count(val_pack["team"], min_prior_games=int(min_games))
+    signature = {
+        "train": int(train_season), "validation": int(validation_season), "min_games": int(min_games),
+        "n_sims": int(n_sims), "rotation": bool(rotation), "eligible": int(eligible),
+    }
+    saved_sig = st.session_state.get("bt_batch_signature")
+    next_index = int(st.session_state.get("bt_next_index", 0))
+    done_games = min(next_index, eligible)
+    st.info(f"Eligible games: {eligible}. Completed/queued through index: {done_games}. Remaining: {max(eligible-done_games,0)}.")
 
-res = st.session_state.get("bt_result")
-if res is not None:
-    st.success(
-        f"Finished in {res.runtime_seconds/60:.1f} min. "
-        f"Projected games: {res.detail['GAME_ID'].nunique() if not res.detail.empty else 0}; failures: {len(res.failures)}."
-    )
-    metrics = metric_table(res.detail)
-    st.subheader("A. Center + distribution validation")
-    st.caption("Bias/MAE/RMSE test the centers. Coverage and CRPS test the Monte Carlo distribution around those centers.")
-    st.dataframe(metrics.round(4), use_container_width=True, hide_index=True)
-
-    st.subheader("B. Probability calibration — synthetic pregame lines")
-    st.caption("These are NOT bookmaker backtests. Half-point lines are generated only from the pregame simulation, so we can test whether 60% behaves like 60% without needing historical odds.")
-    over_bins = calibration_bins(res.probability_rows, "Over")
-    if not over_bins.empty:
-        st.dataframe(over_bins.round(4), use_container_width=True, hide_index=True)
+    if saved_sig is not None and saved_sig != signature and next_index > 0:
+        st.error("Run settings changed after batches were accumulated. Reset the accumulated validation before continuing.")
     else:
-        st.info("Need a larger run before probability bins have enough observations.")
+        if saved_sig is None:
+            st.session_state["bt_batch_signature"] = signature
 
-    st.subheader("C. Team-with-most calibration")
-    ms = most_summary(res.most_rows)
-    st.dataframe(ms.round(4), use_container_width=True, hide_index=True)
+        left, right = st.columns([2,1])
+        run_batch = left.button("2) Run NEXT validation batch", type="primary", disabled=(next_index >= eligible))
+        reset = right.button("Reset accumulated validation")
+        if reset:
+            _empty_state()
+            st.session_state["bt_batch_signature"] = signature
+            st.rerun()
 
-    if not res.failures.empty:
-        with st.expander("Failures / skipped projections"):
-            st.dataframe(res.failures, use_container_width=True, hide_index=True)
+        if run_batch:
+            bar = st.progress(0.0, text=f"Preparing games {next_index+1} onward...")
+            def prog(done, total):
+                bar.progress(done/max(total,1), text=f"This batch: {done}/{total} | season index starts at {next_index}")
+            with st.spinner("Running one resumable historical batch..."):
+                res = run_walk_forward(
+                    val_pack["team"], val_pack["player"], cal,
+                    min_prior_games=int(min_games), n_sims=int(n_sims),
+                    max_games=int(batch_size), start_index=int(next_index),
+                    use_rotation_similarity=bool(rotation), progress_callback=prog,
+                )
+            st.session_state["bt_acc_detail"] = _append(st.session_state.get("bt_acc_detail"), res.detail)
+            st.session_state["bt_acc_prob"] = _append(st.session_state.get("bt_acc_prob"), res.probability_rows)
+            st.session_state["bt_acc_most"] = _append(st.session_state.get("bt_acc_most"), res.most_rows)
+            st.session_state["bt_acc_fail"] = _append(st.session_state.get("bt_acc_fail"), res.failures)
+            st.session_state["bt_next_index"] = int(res.end_index)
+            st.session_state["bt_runtime_total"] = float(st.session_state.get("bt_runtime_total",0.0)) + float(res.runtime_seconds)
+            st.session_state["bt_batch_signature"] = signature
+            bar.empty()
+            st.rerun()
 
-    st.subheader("Downloads")
-    d1,d2,d3 = st.columns(3)
-    d1.download_button("Detailed game-market rows", res.detail.to_csv(index=False).encode(), "nba_backtest_detail.csv", "text/csv")
-    d2.download_button("Probability calibration rows", res.probability_rows.to_csv(index=False).encode(), "nba_backtest_probability_rows.csv", "text/csv")
-    d3.download_button("Most-market rows", res.most_rows.to_csv(index=False).encode(), "nba_backtest_most_rows.csv", "text/csv")
+    # Optional restore after a Streamlit session restart.
+    with st.expander("Checkpoint / restore", expanded=False):
+        up = st.file_uploader("Restore a C3 checkpoint ZIP", type=["zip"], key="bt_restore_zip")
+        if up is not None and st.button("Restore checkpoint"):
+            d,p,m,f,meta = _restore_checkpoint(up.getvalue())
+            if meta.get("signature") != signature:
+                st.error("Checkpoint settings do not match the current train/validation/min-games/sims/rotation settings.")
+            else:
+                st.session_state["bt_acc_detail"] = d
+                st.session_state["bt_acc_prob"] = p
+                st.session_state["bt_acc_most"] = m
+                st.session_state["bt_acc_fail"] = f
+                st.session_state["bt_next_index"] = int(meta.get("next_index",0))
+                st.session_state["bt_runtime_total"] = float(meta.get("runtime_total",0.0))
+                st.session_state["bt_batch_signature"] = signature
+                st.success("Checkpoint restored.")
+                st.rerun()
+
+    detail = st.session_state.get("bt_acc_detail", pd.DataFrame())
+    prob = st.session_state.get("bt_acc_prob", pd.DataFrame())
+    most = st.session_state.get("bt_acc_most", pd.DataFrame())
+    fail = st.session_state.get("bt_acc_fail", pd.DataFrame())
+    next_index = int(st.session_state.get("bt_next_index",0))
+
+    if isinstance(detail, pd.DataFrame) and not detail.empty:
+        projected_games = detail["GAME_ID"].astype(str).nunique()
+        st.success(
+            f"Accumulated projected games: {projected_games}/{eligible}; failures: {len(fail)}; "
+            f"compute time: {float(st.session_state.get('bt_runtime_total',0.0))/60:.1f} min."
+        )
+        metrics = metric_table(detail)
+        st.subheader("A. Center + distribution validation — accumulated batches")
+        st.dataframe(metrics.round(4), use_container_width=True, hide_index=True)
+
+        st.subheader("B. Probability calibration — accumulated synthetic pregame lines")
+        over_bins = calibration_bins(prob, "Over")
+        if not over_bins.empty:
+            st.dataframe(over_bins.round(4), use_container_width=True, hide_index=True)
+
+        st.subheader("C. Team-with-most calibration — accumulated")
+        st.dataframe(most_summary(most).round(4), use_container_width=True, hide_index=True)
+
+        if isinstance(fail, pd.DataFrame) and not fail.empty:
+            with st.expander("Failures / skipped projections"):
+                st.dataframe(fail, use_container_width=True, hide_index=True)
+
+        meta = {
+            "signature": signature,
+            "next_index": next_index,
+            "runtime_total": float(st.session_state.get("bt_runtime_total",0.0)),
+        }
+        st.download_button(
+            "Download resumable checkpoint ZIP",
+            _checkpoint_bytes(detail, prob, most, fail, meta),
+            file_name=f"nba_backtest_checkpoint_{next_index}_of_{eligible}.zip",
+            mime="application/zip",
+        )
+        if next_index >= eligible:
+            st.success("FULL VALIDATION COMPLETE. Freeze/tune only on this 2024-25 result before unlocking 2025-26.")
+            d1,d2,d3 = st.columns(3)
+            d1.download_button("Detailed game-market rows", detail.to_csv(index=False).encode(), "nba_backtest_detail.csv", "text/csv")
+            d2.download_button("Probability calibration rows", prob.to_csv(index=False).encode(), "nba_backtest_probability_rows.csv", "text/csv")
+            d3.download_button("Most-market rows", most.to_csv(index=False).encode(), "nba_backtest_most_rows.csv", "text/csv")
 
 st.divider()
 st.warning(
